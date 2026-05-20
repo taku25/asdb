@@ -1738,7 +1738,7 @@ pub fn build_scanners(scanners_config: &[ScannerConfig]) -> Vec<(Vec<String>, Bo
           "name":        "unreal_cpp",
           "extensions":  [".h", ".cpp", ".inl"],
           "source_dirs": ["Source", "Plugins"],
-          "source_files": [],
+          "source_files_list": "",
           "grammar_dll": "/path/to/tree-sitter-unreal-cpp.dll",
           "query_file":  "/path/to/unreal-cpp.scm"
         },
@@ -1746,7 +1746,7 @@ pub fn build_scanners(scanners_config: &[ScannerConfig]) -> Vec<(Vec<String>, Bo
           "name":        "unreal_assets",
           "extensions":  [".uasset", ".umap"],
           "source_dirs": ["Content"],
-          "source_files": [],
+          "source_files_list": "",
           "scanner_dll": "/path/to/asdb-scanner-ue-assets.dll"
         }
       ],
@@ -3169,8 +3169,8 @@ Core はこの配列をイテレートして拡張子でルーティングする
 |---|---|---|
 | `name` | ✅ | スキャナー識別子 |
 | `extensions` | ✅ | このスキャナーが処理するファイル拡張子 |
-| `source_files` | — | 明示ファイルリスト (`asdb-discover` が返す結果を渡す。指定時は `source_dirs` より優先) |
-| `source_dirs` | — | スキャン対象ディレクトリ (`source_files` が空のときの glob フォールバック) |
+| `source_files_list` | — | 改行区切りファイルパス一覧の **テキストファイルパス** (`asdb-discover` が書き出す。指定時は `source_dirs` より優先) |
+| `source_dirs` | — | スキャン対象ディレクトリ (`source_files_list` が空のときの glob フォールバック) |
 | `grammar_dll` | — | Tree-sitter Grammar DLL パス (text パス) |
 | `query_file` | — | `.scm` クエリファイルパス (`grammar_dll` がある場合必須) |
 | `scanner_dll` | — | バイナリ/特殊スキャナー DLL パス (`grammar_dll` の代替) |
@@ -4022,3 +4022,193 @@ end
 - [x] `mtime` → `mtime_ms` (ミリ秒精度) → §6 `files` テーブル・§10 差分スキャンフロー修正済み
 - [x] `extern "C" fn on_result` に `catch_unwind` 追加 → §8 修正済み (パニック UB 防止)
 - [x] レスポンス直列化を DOM 中間変換なし (`T: Serialize` → `rmp_serde` / `serde_json` 直書き) → §4 修正済み
+- [x] `source_files: []` (RPCで巨大配列を送る設計) → `source_files_list` (テキストファイルパスを渡す設計) に変更 → §8・§17 修正済み
+
+---
+
+## 17. プロジェクトファイル発見設計 (asdb-discover)
+
+### 責務の分離
+
+| コンポーネント | 責務 |
+|---|---|
+| `asdb` (Core) | 渡されたファイルリストを index して検索・補完を返す |
+| `asdb-discover` | プロジェクトファイル (Cargo.toml / .sln 等) を解析して **ファイルリストをテキストファイルに書き出す** |
+| `asdb.nvim` / `asdb-vscode` | `asdb-discover` を呼んでテキストファイルパスを `initialize` RPC に乗せる |
+
+> **Core はプロジェクトファイル形式を一切知らない。**  
+> `asdb-discover` は `asdb` と **別リポジトリ** として配布される独立 CLI ツール。  
+> 「ファイルのリストアップ」という泥臭いビルドシステム固有の処理を完全に切り出すことで、  
+> Core は「渡されたリストをただ無心で最速パースするだけのピュアな筋肉」であり続ける。
+
+---
+
+### なぜ RPC で配列を送らないのか (source_files_list の設計根拠)
+
+UE プロジェクトは 5 万ファイルを超えることがある。  
+`source_files: ["/path/1.cpp", "/path/2.cpp", ...]` という JSON 配列は **数 MB〜数十 MB** に膨れ上がる。
+
+| 問題 | 影響 |
+|---|---|
+| Lua 側の巨大テーブルを MessagePack にシリアライズ | エディタが一瞬フリーズ (Jank) |
+| Rust 側で数 MB の JSON を一括デシリアライズ | 起動直後に不要な CPU スパイク + 大量アロケーション |
+
+**解決策: テキストファイル経由のリスト渡し**
+
+```json
+{
+  "scanners": [
+    {
+      "name": "unreal_cpp",
+      "extensions": [".h", ".cpp"],
+      "source_files_list": "/home/user/.cache/asdb/tmp/abc123_files.txt",
+      "grammar_dll": "..."
+    }
+  ]
+}
+```
+
+- RPC ペイロードは常に数キロバイト以内 → エディタ側ゼロ負荷
+- Core は `BufReader` で 1 行ずつ読み込みながら `rayon` のキューに流せる → メモリ効率最大化
+
+---
+
+### asdb-discover コマンド仕様
+
+```bash
+# compile_commands.json から C++ ソースファイルリスト
+asdb-discover --type compile-commands build/compile_commands.json
+
+# Cargo.toml からワークスペース全 Rust ソース
+asdb-discover --type cargo Cargo.toml
+
+# .sln から C# ソースファイルリスト
+asdb-discover --type msbuild MyGame.sln
+
+# .vcxproj 直接指定
+asdb-discover --type vcxproj MyGame.vcxproj
+
+# go.mod から Go ソース
+asdb-discover --type go-mod go.mod
+
+# *.uproject (UE) からソースファイルリスト
+asdb-discover --type uproject MyGame.uproject
+```
+
+**出力: テキストファイルに改行区切りで書き出し、パスを標準出力に返す**
+
+```bash
+$ asdb-discover --type cargo Cargo.toml
+/home/user/.cache/asdb/tmp/f3a2b1c4_files.txt
+
+$ cat /home/user/.cache/asdb/tmp/f3a2b1c4_files.txt
+/path/to/src/main.rs
+/path/to/src/lib.rs
+/path/to/src/parser.rs
+...
+```
+
+> テキストファイルは `~/.cache/asdb/tmp/<hash>_files.txt` に配置。  
+> `asdb` が `initialize` 完了後にクリーンアップするか、OS の tmp クリーンアップに任せる。
+
+---
+
+### 対応プロジェクトタイプ
+
+| `--type` | 入力ファイル | 内部処理 | 備考 |
+|---|---|---|---|
+| `compile-commands` | `compile_commands.json` | JSON 直接パース | CMake / Meson / Ninja / Bear が生成 |
+| `cargo` | `Cargo.toml` | `cargo metadata --no-deps` 呼び出し | Rust 標準 |
+| `msbuild` | `.sln` / `.vcxproj` | MSBuild XML パース | C# / C++ Visual Studio |
+| `vcxproj` | `.vcxproj` | MSBuild XML パース | C++ プロジェクト単体 |
+| `go-mod` | `go.mod` | `go list ./...` 呼び出し | Go 標準 |
+| `uproject` | `*.uproject` | `Source/` ディレクトリスキャン + `.Build.cs` 列挙 | Unreal Engine |
+
+> **車輪の再発明なし:** `cargo metadata` / `go list` など既存 CLI を最大限活用。  
+> XML パースが必要なのは `.sln` / `.vcxproj` のみ。それ以外は既存ツールの出力を読む。
+
+---
+
+### asdb.nvim との連携フロー
+
+```
+nvim でプロジェクトを開く
+    ↓
+detect.lua がプロジェクトルートと種別を特定 (*.uproject / Cargo.toml / .sln 等)
+    ↓
+asdb-discover --type <type> <project_file> を非同期実行
+    ↓
+標準出力からテキストファイルパスを受け取る
+    ↓
+initialize RPC の scanners[].source_files_list にパスをセットして送信
+    ↓
+asdb Core が BufReader でストリーム読み込みしながらスキャン開始
+```
+
+**Lua 側のイメージ (asdb.nvim):**
+
+```lua
+-- detect.lua がプロジェクトタイプを判別
+local project_type, project_file = detect.find_project(root)
+
+-- asdb-discover を呼び出し (非同期)
+local list_path = vim.fn.system({
+  "asdb-discover", "--type", project_type, project_file
+}):gsub("%s+$", "")  -- trim trailing newline
+
+-- initialize RPC に source_files_list を追加して送信
+client.initialize({
+  root_path = root,
+  config = {
+    scanners = {
+      {
+        name = "cpp",
+        extensions = { ".h", ".cpp" },
+        source_files_list = list_path,  -- ← テキストファイルパスだけ渡す
+        grammar_dll = grammar_dll_path,
+        query_file = query_file_path,
+      }
+    }
+  }
+})
+```
+
+---
+
+### フォールバック戦略
+
+```
+Priority 1: source_files_list が指定されている → テキストファイルをストリーム読み込み
+Priority 2: source_dirs が指定されている      → glob スキャン (従来通り)
+Priority 3: 両方なし                          → root_path 以下を ignore_dirs 除外で全探索
+```
+
+> `source_files_list` と `source_dirs` は排他ではない。  
+> `source_files_list` のファイルが存在しない場合は `source_dirs` にフォールバックする。  
+> Core はファイルが存在しないときに警告ログを出力し、`scan_progress` 通知でエディタに伝える。
+
+---
+
+### Core 側の読み込み実装イメージ (Rust)
+
+```rust
+// source_files_list が指定されている場合、BufReader で1行ずつ rayon に流す
+if let Some(list_path) = scanner_config.source_files_list {
+    let file = BufReader::new(File::open(&list_path)?);
+    file.lines()
+        .filter_map(|l| l.ok())
+        .filter(|l| !l.is_empty())
+        .par_bridge()           // BufReader の行を rayon の並列イテレータに変換
+        .for_each(|path| scan_file(path, &tx));
+} else {
+    // source_dirs glob フォールバック
+    walkdir::WalkDir::new(&root).into_iter()
+        .filter_entry(|e| !is_ignored(e, &ignore_dirs))
+        .par_bridge()
+        .for_each(|entry| scan_file(entry.path(), &tx));
+}
+```
+
+> `par_bridge()` により、テキストファイル読み込みのスループット律速なしに  
+> 並列パースが走る。メモリ上に全ファイルパスを展開する必要がない。
+
