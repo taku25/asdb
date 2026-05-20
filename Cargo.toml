@@ -1,0 +1,10 @@
+[package]
+name = "asdb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libloading = "0.8"
+tree-sitter = "0.24"
+streaming-iterator = "0.1"
+anyhow = "1"
