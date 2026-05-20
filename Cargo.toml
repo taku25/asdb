@@ -1,3 +1,7 @@
+[workspace]
+members = ["asdb-cli"]
+resolver = "2"
+
 [package]
 name = "asdb"
 version = "0.1.0"
