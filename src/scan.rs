@@ -24,6 +24,7 @@ pub struct RawSymbol {
 // TextScanner
 // ──────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub struct TextScanner {
     _lib: Library,
     pub language: Language,

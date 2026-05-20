@@ -223,6 +223,7 @@ impl DbState {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_meta(&self, key: &str) -> Option<String> {
         self.conn
             .query_row("SELECT value FROM project_meta WHERE key=?1", params![key], |r| r.get(0))

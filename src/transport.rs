@@ -8,6 +8,7 @@ use std::io::{self, BufRead, Write};
 
 #[derive(Debug, Deserialize)]
 pub struct RpcRequest {
+    #[allow(dead_code)]
     pub jsonrpc: String,
     pub id: Option<Value>,
     pub method: String,
