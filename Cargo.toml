@@ -1,5 +1,5 @@
 [workspace]
-members = ["asdb-cli", "asdb-grammar-cpp"]
+members = ["asdb-cli"]
 resolver = "2"
 
 [package]
