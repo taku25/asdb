@@ -77,12 +77,31 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS symbols_file_idx ON symbols(file_id);
         CREATE INDEX IF NOT EXISTS symbols_name_idx ON symbols(name_id);
 
+        CREATE TABLE IF NOT EXISTS members (
+            id             INTEGER PRIMARY KEY,
+            symbol_id      INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+            name_id        INTEGER NOT NULL REFERENCES strings(id),
+            kind_id        INTEGER NOT NULL REFERENCES strings(id),
+            access_id      INTEGER NOT NULL REFERENCES strings(id),
+            return_type_id INTEGER REFERENCES strings(id),
+            is_static      INTEGER NOT NULL DEFAULT 0,
+            start_line     INTEGER NOT NULL DEFAULT 0,
+            file_id        INTEGER REFERENCES files(id)
+        );
+        CREATE INDEX IF NOT EXISTS members_symbol_idx ON members(symbol_id);
+
+        CREATE TABLE IF NOT EXISTS inheritance (
+            child_id  INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+            parent_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+            PRIMARY KEY (child_id, parent_id)
+        );
+
         CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
             name,
-            kind,
-            filepath,
-            content='',
-            tokenize='unicode61'
+            kind       UNINDEXED,
+            filepath   UNINDEXED,
+            start_line UNINDEXED,
+            tokenize='unicode61 remove_diacritics 1'
         );
         ",
     )
@@ -90,8 +109,47 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
 }
 
 // ──────────────────────────────────────────────
-// DbState — open connection + string/dir caches
+// Schema version management
 // ──────────────────────────────────────────────
+
+fn ensure_schema_version(conn: &Connection) -> Result<()> {
+    // Create project_meta first (minimal bootstrap).
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
+         CREATE TABLE IF NOT EXISTS project_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+    )?;
+
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM project_meta WHERE key='schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+
+    if stored.as_deref() != Some(SCHEMA_VERSION) {
+        // Wipe all user tables and recreate.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS inheritance;
+             DROP TABLE IF EXISTS members;
+             DROP TABLE IF EXISTS symbols;
+             DROP TABLE IF EXISTS files;
+             DROP TABLE IF EXISTS directories;
+             DROP TABLE IF EXISTS strings;
+             DROP TABLE IF EXISTS project_meta;
+             DROP TABLE IF EXISTS symbols_fts;",
+        )?;
+        apply_schema(conn)?;
+        conn.execute(
+            "INSERT INTO project_meta(key,value) VALUES('schema_version',?1)",
+            params![SCHEMA_VERSION],
+        )?;
+    }
+    Ok(())
+}
+
+// Schema version. Bump this whenever DDL changes to trigger auto-migration.
+const SCHEMA_VERSION: &str = "2";
 
 pub struct DbState {
     pub conn: Connection,
@@ -105,7 +163,7 @@ impl DbState {
             std::fs::create_dir_all(parent).context("create db dir")?;
         }
         let conn = Connection::open(path).context("open db")?;
-        apply_schema(&conn)?;
+        ensure_schema_version(&conn)?;
         Ok(Self { conn, strings: HashMap::new(), dirs: HashMap::new() })
     }
 
@@ -198,13 +256,24 @@ impl DbState {
         }
     }
 
-    /// Replace all symbols for a file.
+    /// Replace all symbols for a file (FTS kept in sync via rowid).
     pub fn replace_symbols(
         &mut self,
         file_id: i64,
         filepath: &str,
         symbols: &[crate::scan::RawSymbol],
     ) -> Result<()> {
+        // Collect existing symbol ids to delete from FTS.
+        let old_ids: Vec<i64> = {
+            let mut stmt =
+                self.conn.prepare("SELECT id FROM symbols WHERE file_id=?1")?;
+            stmt.query_map(params![file_id], |r| r.get(0))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        for id in &old_ids {
+            self.conn.execute("DELETE FROM symbols_fts WHERE rowid=?1", params![id])?;
+        }
         self.conn.execute("DELETE FROM symbols WHERE file_id=?1", params![file_id])?;
 
         for sym in symbols {
@@ -215,9 +284,11 @@ impl DbState {
                  VALUES(?1, ?2, ?3, ?4, ?5)",
                 params![file_id, name_id, kind_id, sym.start_line, sym.start_byte],
             )?;
+            let sym_id = self.conn.last_insert_rowid();
             self.conn.execute(
-                "INSERT INTO symbols_fts(name, kind, filepath) VALUES(?1, ?2, ?3)",
-                params![sym.name, sym.kind, filepath],
+                "INSERT INTO symbols_fts(rowid, name, kind, filepath, start_line)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![sym_id, sym.name, sym.kind, filepath, sym.start_line as i64],
             )?;
         }
         Ok(())

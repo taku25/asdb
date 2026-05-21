@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
+use crate::query;
 use crate::scan::{TextScanner, scan_all};
 use crate::storage::{DbState, resolve_db_path};
 use crate::transport::{RpcRequest, make_error, make_notification, make_response};
@@ -60,6 +61,11 @@ impl Server {
             "ping" => vec![make_response(id, json!({"pong": true}))],
             "file_changed" => self.handle_file_changed(req),
             "shutdown" => vec![make_response(id, json!(null))],
+            "completion" => self.handle_query(id, req.params, query::handle_completion),
+            "search_symbols" => self.handle_query(id, req.params, query::handle_search_symbols),
+            "goto_definition" => self.handle_query(id, req.params, query::handle_goto_definition),
+            "get_members" => self.handle_query(id, req.params, query::handle_get_members),
+            "get_inheritance" => self.handle_query(id, req.params, query::handle_get_inheritance),
             other => {
                 vec![make_error(id, -32601, format!("method not found: {other}"))]
             }
@@ -248,6 +254,25 @@ impl Server {
             }
             Err(e) => vec![make_error(id, -32603, format!("db error: {e}"))],
         }
+    }
+
+    // ──────────────────────────────────────────
+    // Generic query dispatcher
+    // ──────────────────────────────────────────
+
+    fn handle_query(
+        &mut self,
+        id: Value,
+        params: Option<Value>,
+        handler: fn(&DbState, &Value) -> Value,
+    ) -> Vec<String> {
+        let db = match &self.db {
+            Some(d) => d,
+            None => return vec![make_error(id, -32603, "not initialized")],
+        };
+        let params = params.unwrap_or(Value::Object(Default::default()));
+        let result = handler(db, &params);
+        vec![make_response(id, result)]
     }
 }
 

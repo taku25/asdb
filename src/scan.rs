@@ -116,23 +116,12 @@ pub fn scan_file(scanner: &TextScanner, source: &[u8]) -> Vec<RawSymbol> {
             }
         }
 
-        // Extract symbol.type from #set! predicates
-        for pred in scanner.query.general_predicates(pattern) {
-            if pred.operator.as_ref() == "set!" {
-                let args: Vec<&str> = pred
-                    .args
-                    .iter()
-                    .filter_map(|a| {
-                        if let tree_sitter::QueryPredicateArg::String(s) = a {
-                            Some(s.as_ref())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if args.len() == 2 && args[0] == "symbol.type" {
-                    sym_kind = Some(args[1].to_owned());
-                }
+        // Extract symbol.type from #set! predicates.
+        // In tree-sitter 0.22+, #set! is a "property setting" and is accessed via
+        // property_settings(), not general_predicates().
+        for prop in scanner.query.property_settings(pattern) {
+            if &*prop.key == "symbol.type" {
+                sym_kind = prop.value.as_deref().map(str::to_owned);
             }
         }
 
