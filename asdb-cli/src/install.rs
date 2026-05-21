@@ -1,7 +1,7 @@
 /// Grammar DLL のインストール処理
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::config::GrammarEntry;
 use crate::platform::{dll_ext, os_arch_tag};
@@ -120,93 +120,39 @@ fn build_from_source(name: &str, entry: &GrammarEntry, dest: &Path) -> Result<()
 
     anyhow::ensure!(status.success(), "git clone failed (exit {})", status);
 
-    let parser_c = src_dir.join("src").join("parser.c");
-    anyhow::ensure!(
-        parser_c.exists(),
-        "src/parser.c not found in cloned repo. Run `tree-sitter generate` first."
-    );
-
-    // コンパイル対象ファイルを収集
-    let mut c_files: Vec<PathBuf> = vec![parser_c];
-    let scanner_c = src_dir.join("src").join("scanner.c");
-    if scanner_c.exists() {
-        c_files.push(scanner_c);
-    }
-    // C++ スキャナーが存在する場合は別途コンパイルして渡す（将来対応）
-
     let repo_name = repo_name_from_url(&entry.url);
     let ext = dll_ext();
     let dll_path = dest.join(format!("{repo_name}.{ext}"));
 
-    compile_shared_lib(&c_files, &dll_path)?;
+    // Windows では npm スクリプトが .cmd ファイルなので tree-sitter.cmd を使う
+    #[cfg(target_os = "windows")]
+    let tree_sitter_bin = "tree-sitter.cmd";
+    #[cfg(not(target_os = "windows"))]
+    let tree_sitter_bin = "tree-sitter";
+
+    let output = std::process::Command::new(tree_sitter_bin)
+        .args(["build", "--output", dll_path.to_str().unwrap()])
+        .current_dir(&src_dir)
+        .output()
+        .context("tree-sitter CLI not found — please install: npm install -g tree-sitter-cli")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "tree-sitter build failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     // queries/ フォルダをコピー
     let queries_src = src_dir.join("queries");
     if queries_src.exists() {
-        let queries_dst = dest.join("queries");
-        copy_dir_all(&queries_src, &queries_dst)?;
+        copy_dir_all(&queries_src, &dest.join("queries"))?;
         println!("  Copied queries/ folder");
     }
 
     let dll_bytes = std::fs::read(&dll_path)?;
     write_meta(dest, entry, "built_from_source", &hex_sha256(&dll_bytes))?;
     println!("✅ Built and installed '{name}'");
-    Ok(())
-}
-
-// ─────────────────────────────────────────
-// 共有ライブラリのコンパイル
-// ─────────────────────────────────────────
-
-fn compile_shared_lib(c_files: &[PathBuf], out: &Path) -> Result<()> {
-    println!("  Compiling {} source file(s)...", c_files.len());
-
-    // gcc / cc / clang を順に試す
-    #[cfg(target_os = "windows")]
-    let candidates = ["gcc", "cl"];
-    #[cfg(not(target_os = "windows"))]
-    let candidates = ["cc", "gcc", "clang"];
-
-    for compiler in candidates {
-        if try_compile(compiler, c_files, out).is_ok() {
-            return Ok(());
-        }
-    }
-    anyhow::bail!(
-        "No C compiler found. Please install gcc / clang (Linux/macOS) \
-         or MSVC / MinGW (Windows)."
-    )
-}
-
-fn try_compile(compiler: &str, c_files: &[PathBuf], out: &Path) -> Result<()> {
-    let mut cmd = std::process::Command::new(compiler);
-
-    if compiler == "cl" {
-        // MSVC
-        for f in c_files {
-            cmd.arg(f);
-        }
-        cmd.arg("/O2")
-            .arg("/LD")
-            .arg(format!("/Fe:{}", out.display()));
-    } else {
-        // GCC / Clang (+ MinGW on Windows)
-        cmd.arg("-O2").arg("-shared");
-        // Windows (MinGW) は -fPIC 不要
-        #[cfg(not(target_os = "windows"))]
-        cmd.arg("-fPIC");
-        for f in c_files {
-            cmd.arg(f);
-        }
-        cmd.arg("-o").arg(out);
-    }
-
-    let output = cmd.output().context("Compiler not found")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "Compilation failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     Ok(())
 }
 
